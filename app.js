@@ -42,6 +42,7 @@ const LEVELS = ['알파벳', '파닉스', '1', '2', '3', '4', '5', '80', '100', 
 const PRODUCTS = ['단과', '전과목', '자주표A', '자주표B'];
 const WEEKDAYS = ['월', '화', '수', '목', '금'];
 const HOLIDAY_REASONS = ['알파벳', '휴지', '사전공유'];
+const GRADES = ['7세', '1', '2', '3', '4', '5', '6', '중1', '중2'];
 
 function cn(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -149,7 +150,7 @@ function hypotheticalCount(students, weekday, time, weekMonday, label) {
     return false;
   }).length;
 }
-function buildSchedule({ students, guests = [], weekMondays }) {
+function buildSchedule({ students, guests = [], weekMondays, biweeklyRooms = [] }) {
   return weekMondays.map((weekMonday) => {
     const label = weekLabel(weekMonday);
     const slots = {};
@@ -157,9 +158,11 @@ function buildSchedule({ students, guests = [], weekMondays }) {
       slots[weekday] = {};
       for (const time of TIME_SLOTS) {
         const classDateIso = dateOfWeekday(weekMonday, weekday);
-        const occupantStudents = students.filter(
-          (s) => s.weekday === weekday && s.time === time && studentAppliesToWeek(s, weekMonday)
-        );
+        const biweeklyEntry = biweeklyRooms.find((r) => r.weekday === weekday && r.time === time);
+        const isBiweeklyOffWeek = !!biweeklyEntry && biweeklyEntry.parity !== label;
+        const occupantStudents = isBiweeklyOffWeek
+          ? []
+          : students.filter((s) => s.weekday === weekday && s.time === time && studentAppliesToWeek(s, weekMonday));
         const occupants = occupantStudents.map((s) => toOccupant(s, classDateIso));
         const currentCount = occupants.filter((o) => !o.onLeave).length;
         const otherLabel = label === 'A' ? 'B' : 'A';
@@ -169,8 +172,11 @@ function buildSchedule({ students, guests = [], weekMondays }) {
         if (currentCount >= FIXED_CAPACITY) capacityBadge = 'FULL';
         else if (otherCount >= FIXED_CAPACITY) capacityBadge = 'WARN';
 
+        // A single coaching room can only ever hold one level at a time, so any 2+
+        // distinct levels appearing together in the same slot/week is a real conflict
+        // (not just a "mix") and needs to be flagged and fixed by the teacher.
         const distinctLevels = new Set(occupants.filter((o) => !o.onLeave).map((o) => o.level));
-        const levelMixWarning = distinctLevels.size >= 3;
+        const levelMixWarning = distinctLevels.size >= 2;
 
         const fixedTableActiveCount = occupants.filter(
           (o) => !o.onLeave && (o.product === '자주표A' || o.product === '자주표B')
@@ -181,7 +187,11 @@ function buildSchedule({ students, guests = [], weekMondays }) {
           (g) => g.weekday === weekday && g.time === time && g.weekMonday === weekMonday
         ).length;
 
-        slots[weekday][time] = { weekday, time, weekMonday, occupants, guestCount, capacityBadge, levelMixWarning, fixedTableOverflow };
+        slots[weekday][time] = {
+          weekday, time, weekMonday, occupants, guestCount, capacityBadge, levelMixWarning, fixedTableOverflow,
+          biweekly: !!biweeklyEntry,
+          biweeklyParity: biweeklyEntry ? biweeklyEntry.parity : null,
+        };
       }
     }
     return { weekMonday, weekLabel: label, slots };
@@ -234,6 +244,21 @@ function capacityBadgeForSlot(students, weekday, time, weekMondays) {
     if (otherCount >= FIXED_CAPACITY) worst = 'WARN';
   }
   return worst;
+}
+
+// A/B-parity-aware week filter: 자주표A/B students only ever meet on their own
+// parity week, so capacity/level checks for them should ignore the other week
+// entirely (a full or leveled A-week room doesn't block a B-week suggestion).
+function relevantWeekMondaysForProduct(weekMondays, product) {
+  if (product === '자주표A') {
+    const only = weekMondays.filter((wm) => weekLabel(wm) === 'A');
+    return only.length > 0 ? only : weekMondays;
+  }
+  if (product === '자주표B') {
+    const only = weekMondays.filter((wm) => weekLabel(wm) === 'B');
+    return only.length > 0 ? only : weekMondays;
+  }
+  return weekMondays;
 }
 
 // Returns the max number of active 자주표A/B occupants for a weekday/time across
@@ -304,20 +329,25 @@ function parseAvailability(note) {
   };
 }
 
-function suggestSlotsForNote(note, students, weekMondays, excludeStudentId, studentProduct) {
+function suggestSlotsForNote(note, students, weekMondays, excludeStudentId, studentProduct, biweeklyRooms = []) {
   const availability = parseAvailability(note);
   if (!availability) return [];
   const others = excludeStudentId ? students.filter((s) => s.id !== excludeStudentId) : students;
   const isFixedTableStudent = studentProduct === '자주표A' || studentProduct === '자주표B';
+  const relevantWeeks = relevantWeekMondaysForProduct(weekMondays, studentProduct);
   const suggestions = [];
   for (const weekday of WEEKDAYS) {
     if (!availability.weekdays.has(weekday)) continue;
     for (const time of TIME_SLOTS) {
       const hour = parseInt(time.split(':')[0], 10);
       if (hour < availability.minHour || hour >= availability.maxHour) continue;
-      const badge = capacityBadgeForSlot(others, weekday, time, weekMondays);
+      // 격주(biweekly) 방은 자주표A/B 회원만 배정할 수 있습니다 — 단과/전과목은 매주 수업이라
+      // 격주로만 열리는 방에는 들어갈 수 없습니다.
+      const biweeklyEntry = biweeklyRooms.find((r) => r.weekday === weekday && r.time === time);
+      if (biweeklyEntry && !isFixedTableStudent) continue;
+      const badge = capacityBadgeForSlot(others, weekday, time, relevantWeeks);
       if (badge === 'FULL') continue;
-      if (isFixedTableStudent && fixedTableCountForSlot(others, weekday, time, weekMondays) >= 4) continue;
+      if (isFixedTableStudent && fixedTableCountForSlot(others, weekday, time, relevantWeeks) >= 4) continue;
       suggestions.push({ weekday, time, badge });
     }
   }
@@ -475,7 +505,6 @@ function pick(arr, seed) {
 function randomName(seed) {
   return pick(SURNAMES, seed) + pick(GIVEN, seed * 7 + 3);
 }
-const GRADES = ['7세', '1', '2', '3', '4', '5', '6', '중1', '중2'];
 const MOCK_PRODUCTS = ['단과', '전과목', '전과목', '전과목', '자주표A', '자주표B'];
 const MOCK_STATUSES = ['시도 전', '진행중', '완료'];
 const MOCK_TIME_SLOTS = generateTimeSlots(15, 21);
@@ -536,6 +565,7 @@ function defaultSharedData() {
     teams: TEAMS.slice(),
     teachers: TEACHERS.slice(),
     adminPassword: null,
+    biweeklyRooms: [],
   };
 }
 
@@ -549,6 +579,7 @@ function migrateSharedData(data) {
   if (!Array.isArray(data.teams) || data.teams.length === 0) data.teams = TEAMS.slice();
   if (!Array.isArray(data.teachers) || data.teachers.length === 0) data.teachers = TEACHERS.slice();
   if (data.adminPassword === undefined) data.adminPassword = null;
+  if (!Array.isArray(data.biweeklyRooms)) data.biweeklyRooms = [];
   for (const s of data.students) {
     if (s.important === undefined) s.important = false;
   }
@@ -839,6 +870,15 @@ function AppProvider({ children, entry }) {
           ...s,
           students: s.students.map((st) => (st.id === studentId ? { ...st, weekday, time } : st)),
         })),
+      toggleBiweeklyRoom: (teacherId, weekday, time, weekLabelNow) =>
+        updateData((s) => {
+          const rooms = s.biweeklyRooms || [];
+          const idx = rooms.findIndex((r) => r.teacherId === teacherId && r.weekday === weekday && r.time === time);
+          if (idx >= 0) {
+            return { ...s, biweeklyRooms: rooms.filter((_, i) => i !== idx) };
+          }
+          return { ...s, biweeklyRooms: [...rooms, { id: uid(), teacherId, weekday, time, parity: weekLabelNow }] };
+        }),
     }),
     [data, updateData, baseMonday]
   );
@@ -1069,11 +1109,15 @@ function HolidayEditor({ student }) {
 const PRODUCT_TONE = { 단과: 'gray', 전과목: 'gray', 자주표A: 'blue', 자주표B: 'blue' };
 
 function SuggestionRow({ student, weekMondays }) {
-  const { students, moveStudentToSlot } = useApp();
+  const { students, moveStudentToSlot, biweeklyRooms } = useApp();
   const teacherPeers = useMemo(() => students.filter((s) => s.teacherId === student.teacherId), [students, student.teacherId]);
+  const teacherBiweeklyRooms = useMemo(
+    () => (biweeklyRooms || []).filter((r) => r.teacherId === student.teacherId),
+    [biweeklyRooms, student.teacherId]
+  );
   const suggestions = useMemo(
-    () => suggestSlotsForNote(student.availableNote, teacherPeers, weekMondays, student.id, student.product),
-    [student.availableNote, teacherPeers, weekMondays, student.id, student.product]
+    () => suggestSlotsForNote(student.availableNote, teacherPeers, weekMondays, student.id, student.product, teacherBiweeklyRooms),
+    [student.availableNote, teacherPeers, weekMondays, student.id, student.product, teacherBiweeklyRooms]
   );
 
   if (!student.availableNote.trim() || suggestions.length === 0) return null;
@@ -1110,8 +1154,14 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
   }
 
   const capacityBadge = useMemo(
-    () => capacityBadgeForSlot(students.filter((s) => s.teacherId === student.teacherId && s.id !== student.id), student.weekday, student.time, weekMondays),
-    [students, student.teacherId, student.id, student.weekday, student.time, weekMondays]
+    () =>
+      capacityBadgeForSlot(
+        students.filter((s) => s.teacherId === student.teacherId && s.id !== student.id),
+        student.weekday,
+        student.time,
+        relevantWeekMondaysForProduct(weekMondays, student.product)
+      ),
+    [students, student.teacherId, student.id, student.weekday, student.time, weekMondays, student.product]
   );
 
   return (
@@ -1127,7 +1177,7 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
         e.dataTransfer.effectAllowed = 'move';
       }}
     >
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-nowrap items-center gap-2 overflow-x-auto">
         <button onClick={() => setExpanded((v) => !v)} className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-gray-400 hover:bg-gray-100">
           {expanded ? <ChevronDownIcon className="h-4 w-4" /> : <ChevronRightIcon className="h-4 w-4" />}
         </button>
@@ -1146,7 +1196,16 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </span>
         )}
 
-        <Input value={student.grade} onChange={(e) => patch({ grade: e.target.value })} placeholder="학년" className="w-[48px] shrink-0" />
+        <div className="w-[64px] shrink-0">
+          <Select
+            value={student.grade}
+            onChange={(e) => patch({ grade: e.target.value })}
+            className={cn((student.grade === '7세' || student.grade === '6') && 'font-semibold text-red-600')}
+          >
+            {!GRADES.includes(student.grade) && student.grade && <option value={student.grade}>{student.grade}</option>}
+            {GRADES.map((g) => <option key={g} value={g}>{g}</option>)}
+          </Select>
+        </div>
 
         <div className="w-[74px] shrink-0">
           <Select value={student.level} onChange={(e) => patch({ level: e.target.value })}>
@@ -1171,13 +1230,18 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </Select>
         </div>
 
-        {student.important && (
-          <span className="ml-auto max-w-[160px] shrink truncate text-[11px] font-semibold text-red-600" title={student.memo || '중요'}>
-            ★ {student.memo || '중요'}
-          </span>
-        )}
+        <div className="flex min-w-[40px] flex-1 items-center gap-1.5 overflow-hidden">
+          {student.important && (
+            <>
+              <Badge tone="red" className="shrink-0">중요</Badge>
+              <span className="truncate text-[11px] font-medium text-red-600" title={student.memo || ''}>
+                {student.memo || '메모 없음'}
+              </span>
+            </>
+          )}
+        </div>
 
-        <div className={cn('w-[92px] shrink-0', !student.important && 'ml-auto')}>
+        <div className="w-[92px] shrink-0">
           <Select value={student.status} onChange={(e) => patch({ status: e.target.value })}>
             {MEMBER_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </Select>
@@ -1188,12 +1252,14 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
         <span className="inline-flex items-center gap-1">
           <span className="text-gray-400">시작</span> {formatMonthDay(student.startWeek)}
         </span>
-        <span className="inline-flex min-w-0 max-w-[280px] items-center gap-1 truncate">
-          <span className="shrink-0 text-gray-400">메모</span>
-          <span className={cn('truncate', student.important ? 'font-semibold text-red-600' : '')}>
-            {student.memo ? student.memo : <span className="text-gray-300">없음</span>}
+        {!student.important && (
+          <span className="inline-flex min-w-0 max-w-[280px] items-center gap-1 truncate">
+            <span className="shrink-0 text-gray-400">메모</span>
+            <span className="truncate">
+              {student.memo ? student.memo : <span className="text-gray-300">없음</span>}
+            </span>
           </span>
-        </span>
+        )}
         {student.important && (
           <Badge tone="red" className="shrink-0">중요</Badge>
         )}
@@ -1409,7 +1475,7 @@ function StudentChip({ occupant, onDragStart, onClick }) {
   );
 }
 
-function CoachingRoomCard({ slot, onJumpToStudent }) {
+function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
   const { moveStudentToSlot } = useApp();
   const [dragOver, setDragOver] = useState(false);
 
@@ -1443,8 +1509,8 @@ function CoachingRoomCard({ slot, onJumpToStudent }) {
             </span>
           )}
           {slot.levelMixWarning && (
-            <span className="inline-flex items-center gap-0.5 rounded bg-purple-100 px-1.5 py-[1px] text-[10px] font-medium text-purple-700">
-              <LayersIcon className="h-2.5 w-2.5" /> 레벨 혼합
+            <span className="inline-flex items-center gap-0.5 rounded bg-red-600 px-1.5 py-[1px] text-[10px] font-semibold text-white">
+              <LayersIcon className="h-2.5 w-2.5" /> 레벨 충돌
             </span>
           )}
           {slot.fixedTableOverflow && (
@@ -1455,17 +1521,30 @@ function CoachingRoomCard({ slot, onJumpToStudent }) {
         </div>
       )}
 
-      {slot.occupants.length > 0 && (
+      {(slot.occupants.length > 0 || slot.biweekly) && (
         <div className="mb-1 flex items-center justify-between px-0.5">
           <span className="flex items-center gap-1 text-sm font-extrabold leading-none">
-            {levels.slice(0, 2).map((lv, i) => (
-              <span key={lv} style={{ color: levelColor(lv) }}>
-                {i > 0 && <span className="text-gray-300">/</span>}Lv.{lv}
-              </span>
-            ))}
-            {levels.length > 2 && <span className="text-gray-400">…</span>}
+            <Checkbox
+              checked={!!slot.biweekly}
+              onChange={() => onToggleBiweekly && onToggleBiweekly(slot.weekday, slot.time)}
+              className="mr-0.5"
+            />
+            {slot.occupants.length > 0 ? (
+              <>
+                {levels.slice(0, 2).map((lv, i) => (
+                  <span key={lv} style={{ color: levelColor(lv) }}>
+                    {i > 0 && <span className="text-gray-300">/</span>}Lv.{lv}
+                  </span>
+                ))}
+                {levels.length > 2 && <span className="text-gray-400">…</span>}
+              </>
+            ) : (
+              <span className="text-[10px] font-medium text-gray-400" title="격주로 열리는 방입니다. 이번 주는 쉬는 주입니다.">격주 휴무주</span>
+            )}
           </span>
-          <span className={cn('text-xs font-bold', activeCount >= FIXED_CAPACITY ? 'text-red-600' : 'text-sky-600')}>{activeCount}/{FIXED_CAPACITY}</span>
+          {slot.occupants.length > 0 && (
+            <span className={cn('text-xs font-bold', activeCount >= FIXED_CAPACITY ? 'text-red-600' : 'text-sky-600')}>{activeCount}/{FIXED_CAPACITY}</span>
+          )}
         </div>
       )}
 
@@ -1483,7 +1562,7 @@ function CoachingRoomCard({ slot, onJumpToStudent }) {
   );
 }
 
-function WeekBlock({ label, grid, onJumpToStudent }) {
+function WeekBlock({ label, grid, onJumpToStudent, onToggleBiweekly }) {
   return (
     <div className="mb-6">
       <div className="mb-2 flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 shadow-sm">
@@ -1502,7 +1581,14 @@ function WeekBlock({ label, grid, onJumpToStudent }) {
         {TIME_SLOTS.map((time) => (
           <Fragment key={time}>
             <div className="flex items-center justify-end pr-1 text-[10px] font-medium text-gray-400">{time}</div>
-            {WEEKDAYS.map((wd) => <CoachingRoomCard key={`${wd}-${time}`} slot={grid.slots[wd][time]} onJumpToStudent={onJumpToStudent} />)}
+            {WEEKDAYS.map((wd) => (
+              <CoachingRoomCard
+                key={`${wd}-${time}`}
+                slot={grid.slots[wd][time]}
+                onJumpToStudent={onJumpToStudent}
+                onToggleBiweekly={(weekday, t) => onToggleBiweekly && onToggleBiweekly(weekday, t, grid.weekLabel)}
+              />
+            ))}
           </Fragment>
         ))}
       </div>
@@ -1511,15 +1597,26 @@ function WeekBlock({ label, grid, onJumpToStudent }) {
 }
 
 function SchedulePanel({ onJumpToStudent }) {
-  const { students, selectedTeacherId, baseMonday } = useApp();
+  const { students, selectedTeacherId, baseMonday, biweeklyRooms, toggleBiweeklyRoom } = useApp();
   const teacherStudents = useMemo(() => students.filter((s) => s.teacherId === selectedTeacherId), [students, selectedTeacherId]);
+  const teacherBiweeklyRooms = useMemo(
+    () => (biweeklyRooms || []).filter((r) => r.teacherId === selectedTeacherId),
+    [biweeklyRooms, selectedTeacherId]
+  );
   const weekMondays = useMemo(() => [baseMonday, addWeeks(baseMonday, 1)], [baseMonday]);
-  const grids = useMemo(() => buildSchedule({ students: teacherStudents, weekMondays }), [teacherStudents, weekMondays]);
+  const grids = useMemo(
+    () => buildSchedule({ students: teacherStudents, weekMondays, biweeklyRooms: teacherBiweeklyRooms }),
+    [teacherStudents, weekMondays, teacherBiweeklyRooms]
+  );
+
+  function handleToggleBiweekly(weekday, time, weekLabelNow) {
+    toggleBiweeklyRoom(selectedTeacherId, weekday, time, weekLabelNow);
+  }
 
   return (
     <div className="h-full overflow-y-auto px-4 py-4">
-      <WeekBlock label="이번 주" grid={grids[0]} onJumpToStudent={onJumpToStudent} />
-      <WeekBlock label="다음 주" grid={grids[1]} onJumpToStudent={onJumpToStudent} />
+      <WeekBlock label="이번 주" grid={grids[0]} onJumpToStudent={onJumpToStudent} onToggleBiweekly={handleToggleBiweekly} />
+      <WeekBlock label="다음 주" grid={grids[1]} onJumpToStudent={onJumpToStudent} onToggleBiweekly={handleToggleBiweekly} />
     </div>
   );
 }

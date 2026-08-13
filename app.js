@@ -1,6 +1,7 @@
 "use strict";
 const { useState, useMemo, useEffect, useRef, useCallback, createContext, useContext, Fragment, StrictMode } = React;
 
+
 // ---------- Minimal dependency-free icons ----------
 function Icon({ path, className, strokeWidth = 2 }) {
   return (
@@ -40,6 +41,7 @@ const MEMBER_STATUSES = ['시도 전', '진행중', '완료', '이관회원'];
 const LEVELS = ['알파벳', '파닉스', '1', '2', '3', '4', '5', '80', '100', '문법'];
 const PRODUCTS = ['단과', '전과목', '자주표A', '자주표B'];
 const WEEKDAYS = ['월', '화', '수', '목', '금'];
+const HOLIDAY_REASONS = ['알파벳', '휴지', '사전공유'];
 
 function cn(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -127,6 +129,7 @@ function toOccupant(student, classDateIso) {
   const onLeave = studentOnLeave(student, classDateIso);
   return {
     studentId: student.id,
+    memberNo: student.memberNo,
     name: student.name,
     level: student.level,
     product: student.product,
@@ -169,11 +172,16 @@ function buildSchedule({ students, guests = [], weekMondays }) {
         const distinctLevels = new Set(occupants.filter((o) => !o.onLeave).map((o) => o.level));
         const levelMixWarning = distinctLevels.size >= 3;
 
+        const fixedTableActiveCount = occupants.filter(
+          (o) => !o.onLeave && (o.product === '자주표A' || o.product === '자주표B')
+        ).length;
+        const fixedTableOverflow = fixedTableActiveCount >= 5;
+
         const guestCount = guests.filter(
           (g) => g.weekday === weekday && g.time === time && g.weekMonday === weekMonday
         ).length;
 
-        slots[weekday][time] = { weekday, time, weekMonday, occupants, guestCount, capacityBadge, levelMixWarning };
+        slots[weekday][time] = { weekday, time, weekMonday, occupants, guestCount, capacityBadge, levelMixWarning, fixedTableOverflow };
       }
     }
     return { weekMonday, weekLabel: label, slots };
@@ -228,6 +236,23 @@ function capacityBadgeForSlot(students, weekday, time, weekMondays) {
   return worst;
 }
 
+// Returns the max number of active 자주표A/B occupants for a weekday/time across
+// both displayed weeks (used to steer suggestions/overflow warnings for 자주표 rooms).
+function fixedTableCountForSlot(students, weekday, time, weekMondays) {
+  let max = 0;
+  for (const weekMonday of weekMondays) {
+    const classDateIso = dateOfWeekday(weekMonday, weekday);
+    const count = students.filter((s) => {
+      if (s.weekday !== weekday || s.time !== time) return false;
+      if (s.product !== '자주표A' && s.product !== '자주표B') return false;
+      if (!studentAppliesToWeek(s, weekMonday)) return false;
+      return !studentOnLeave(s, classDateIso);
+    }).length;
+    if (count > max) max = count;
+  }
+  return max;
+}
+
 // ---------- best-effort Korean availability text -> suggested slots ----------
 // Parses free text like "월,수 저녁 가능", "화 6시 이후 가능", "주말만 가능" into
 // weekday + time-of-day hints, then cross-references the teacher's current schedule
@@ -279,10 +304,11 @@ function parseAvailability(note) {
   };
 }
 
-function suggestSlotsForNote(note, students, weekMondays, excludeStudentId) {
+function suggestSlotsForNote(note, students, weekMondays, excludeStudentId, studentProduct) {
   const availability = parseAvailability(note);
   if (!availability) return [];
   const others = excludeStudentId ? students.filter((s) => s.id !== excludeStudentId) : students;
+  const isFixedTableStudent = studentProduct === '자주표A' || studentProduct === '자주표B';
   const suggestions = [];
   for (const weekday of WEEKDAYS) {
     if (!availability.weekdays.has(weekday)) continue;
@@ -291,6 +317,7 @@ function suggestSlotsForNote(note, students, weekMondays, excludeStudentId) {
       if (hour < availability.minHour || hour >= availability.maxHour) continue;
       const badge = capacityBadgeForSlot(others, weekday, time, weekMondays);
       if (badge === 'FULL') continue;
+      if (isFixedTableStudent && fixedTableCountForSlot(others, weekday, time, weekMondays) >= 4) continue;
       suggestions.push({ weekday, time, badge });
     }
   }
@@ -995,6 +1022,7 @@ function HolidayEditor({ student }) {
   const { addHolidayPeriod, removeHolidayPeriod } = useApp();
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
+  const [reason, setReason] = useState(HOLIDAY_REASONS[0]);
 
   return (
     <div>
@@ -1004,7 +1032,7 @@ function HolidayEditor({ student }) {
         )}
         {student.holidayPeriods.map((hp) => (
           <span key={hp.id} className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-1 text-[11px] text-gray-600">
-            {formatMonthDay(hp.startDate)} ~ {formatMonthDay(hp.endDate)}
+            결석({formatMonthDay(hp.startDate)}~{formatMonthDay(hp.endDate)}){hp.reason ? ` · ${hp.reason}` : ''}
             <button onClick={() => removeHolidayPeriod(student.id, hp.id)} className="text-gray-400 hover:text-gray-700">
               <XIcon className="h-3 w-3" />
             </button>
@@ -1015,13 +1043,18 @@ function HolidayEditor({ student }) {
         <Input type="date" value={start} onChange={(e) => setStart(e.target.value)} className="w-[130px]" />
         <span className="text-xs text-gray-400">~</span>
         <Input type="date" value={end} onChange={(e) => setEnd(e.target.value)} className="w-[130px]" />
+        <div className="w-[104px]">
+          <Select value={reason} onChange={(e) => setReason(e.target.value)}>
+            {HOLIDAY_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}
+          </Select>
+        </div>
         <Button
           size="sm"
           variant="outline"
           disabled={!start || !end}
           onClick={() => {
             if (!start || !end) return;
-            addHolidayPeriod(student.id, { startDate: start, endDate: end, reason: '타 클래스 참여' });
+            addHolidayPeriod(student.id, { startDate: start, endDate: end, reason });
             setStart('');
             setEnd('');
           }}
@@ -1039,8 +1072,8 @@ function SuggestionRow({ student, weekMondays }) {
   const { students, moveStudentToSlot } = useApp();
   const teacherPeers = useMemo(() => students.filter((s) => s.teacherId === student.teacherId), [students, student.teacherId]);
   const suggestions = useMemo(
-    () => suggestSlotsForNote(student.availableNote, teacherPeers, weekMondays, student.id),
-    [student.availableNote, teacherPeers, weekMondays, student.id]
+    () => suggestSlotsForNote(student.availableNote, teacherPeers, weekMondays, student.id, student.product),
+    [student.availableNote, teacherPeers, weekMondays, student.id, student.product]
   );
 
   if (!student.availableNote.trim() || suggestions.length === 0) return null;
@@ -1070,8 +1103,7 @@ function SuggestionRow({ student, weekMondays }) {
 
 function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
   const [expanded, setExpanded] = useState(false);
-  const { role, updateStudent, removeStudent, students } = useApp();
-  const canEditAdminFields = role === 'admin';
+  const { updateStudent, removeStudent, students } = useApp();
 
   function patch(p) {
     updateStudent(student.id, p);
@@ -1100,9 +1132,7 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           {expanded ? <ChevronDownIcon className="h-4 w-4" /> : <ChevronRightIcon className="h-4 w-4" />}
         </button>
 
-        <Checkbox checked={!!student.important} onChange={(v) => patch({ important: v })} />
-
-        <Input value={student.memberNo} onChange={(e) => patch({ memberNo: e.target.value })} placeholder="회원번호" disabled={!canEditAdminFields} className="w-[88px] shrink-0" />
+        <Input value={student.memberNo} onChange={(e) => patch({ memberNo: e.target.value })} placeholder="회원번호" className="w-[88px] shrink-0" />
         <Input
           value={student.name}
           onChange={(e) => patch({ name: e.target.value })}
@@ -1116,7 +1146,7 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </span>
         )}
 
-        <Input value={student.grade} onChange={(e) => patch({ grade: e.target.value })} placeholder="학년" disabled={!canEditAdminFields} className="w-[48px] shrink-0" />
+        <Input value={student.grade} onChange={(e) => patch({ grade: e.target.value })} placeholder="학년" className="w-[48px] shrink-0" />
 
         <div className="w-[74px] shrink-0">
           <Select value={student.level} onChange={(e) => patch({ level: e.target.value })}>
@@ -1124,12 +1154,11 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </Select>
         </div>
 
-        <div className="w-[80px] shrink-0">
+        <div className="w-[104px] shrink-0">
           <Select value={student.product} onChange={(e) => patch({ product: e.target.value })}>
             {PRODUCTS.map((p) => <option key={p} value={p}>{p}</option>)}
           </Select>
         </div>
-        <Badge tone={PRODUCT_TONE[student.product]} className="shrink-0">{student.product}</Badge>
 
         <div className="w-[54px] shrink-0">
           <Select value={student.weekday} onChange={(e) => patch({ weekday: e.target.value })}>
@@ -1142,7 +1171,13 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </Select>
         </div>
 
-        <div className="ml-auto w-[92px] shrink-0">
+        {student.important && (
+          <span className="ml-auto max-w-[160px] shrink truncate text-[11px] font-semibold text-red-600" title={student.memo || '중요'}>
+            ★ {student.memo || '중요'}
+          </span>
+        )}
+
+        <div className={cn('w-[92px] shrink-0', !student.important && 'ml-auto')}>
           <Select value={student.status} onChange={(e) => patch({ status: e.target.value })}>
             {MEMBER_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </Select>
@@ -1162,9 +1197,11 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
         {student.important && (
           <Badge tone="red" className="shrink-0">중요</Badge>
         )}
-        {student.holidayPeriods.length > 0 && (
-          <Badge tone="gray" className="shrink-0">결석기간 {student.holidayPeriods.length}</Badge>
-        )}
+        {student.holidayPeriods.map((hp) => (
+          <Badge key={hp.id} tone="gray" className="shrink-0">
+            결석({formatMonthDay(hp.startDate)}~{formatMonthDay(hp.endDate)}){hp.reason ? ` · ${hp.reason}` : ''}
+          </Badge>
+        ))}
       </div>
 
       {capacityBadge && (
@@ -1188,7 +1225,6 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
               <Input
                 value={student.availableNote}
                 onChange={(e) => patch({ availableNote: e.target.value })}
-                disabled={!canEditAdminFields}
                 placeholder="예: 월,수 저녁 가능"
                 className="w-full"
               />
@@ -1196,7 +1232,10 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           </div>
 
           <div>
-            <label className="mb-1 block text-[11px] font-medium text-gray-400">메모 (전체 내용 수정)</label>
+            <div className="mb-1 flex items-center gap-2">
+              <label className="block text-[11px] font-medium text-gray-400">메모 (전체 내용 수정)</label>
+              <Checkbox checked={!!student.important} onChange={(v) => patch({ important: v })} label="중요" />
+            </div>
             <Input value={student.memo} onChange={(e) => patch({ memo: e.target.value })} placeholder="선생님 메모" className="w-full" />
           </div>
 
@@ -1341,16 +1380,19 @@ const OCCUPANT_COLOR_CLASSES = {
   gray: 'text-gray-400 border-gray-200 bg-gray-50 italic',
 };
 
-function StudentChip({ occupant, onDragStart }) {
+function StudentChip({ occupant, onDragStart, onClick }) {
   return (
     <Tooltip
       trigger={
         <div
           draggable
           onDragStart={onDragStart}
-          className={cn('cursor-grab truncate rounded-md border px-1.5 py-[3px] text-[11px] leading-tight active:cursor-grabbing', OCCUPANT_COLOR_CLASSES[occupant.color])}
+          onClick={onClick}
+          className={cn('cursor-pointer truncate rounded-md border px-1.5 py-[3px] text-[11px] leading-tight active:cursor-grabbing', OCCUPANT_COLOR_CLASSES[occupant.color])}
+          title="클릭하면 왼쪽 회원 목록에서 이 회원을 찾아줍니다"
         >
           {occupant.name}
+          {occupant.memberNo && <span className="ml-0.5 opacity-60">({occupant.memberNo})</span>}
           {occupant.onLeave && <span className="ml-0.5">(알)</span>}
         </div>
       }
@@ -1367,7 +1409,7 @@ function StudentChip({ occupant, onDragStart }) {
   );
 }
 
-function CoachingRoomCard({ slot }) {
+function CoachingRoomCard({ slot, onJumpToStudent }) {
   const { moveStudentToSlot } = useApp();
   const [dragOver, setDragOver] = useState(false);
 
@@ -1390,7 +1432,7 @@ function CoachingRoomCard({ slot }) {
         dragOver && 'ring-2 ring-blue-400'
       )}
     >
-      {(slot.capacityBadge || slot.levelMixWarning) && (
+      {(slot.capacityBadge || slot.levelMixWarning || slot.fixedTableOverflow) && (
         <div className="mb-1 flex flex-wrap gap-1">
           {slot.capacityBadge === 'FULL' && (
             <span className="inline-flex items-center gap-0.5 rounded bg-red-600 px-1.5 py-[1px] text-[10px] font-semibold text-white">FULL</span>
@@ -1403,6 +1445,11 @@ function CoachingRoomCard({ slot }) {
           {slot.levelMixWarning && (
             <span className="inline-flex items-center gap-0.5 rounded bg-purple-100 px-1.5 py-[1px] text-[10px] font-medium text-purple-700">
               <LayersIcon className="h-2.5 w-2.5" /> 레벨 혼합
+            </span>
+          )}
+          {slot.fixedTableOverflow && (
+            <span className="inline-flex items-center gap-0.5 rounded bg-orange-500 px-1.5 py-[1px] text-[10px] font-semibold text-white">
+              <AlertIcon className="h-2.5 w-2.5" /> 자주표 초과
             </span>
           )}
         </div>
@@ -1422,12 +1469,13 @@ function CoachingRoomCard({ slot }) {
         </div>
       )}
 
-      <div className="space-y-0.5">
+      <div className="flex flex-col gap-0.5">
         {slot.occupants.map((o) => (
           <StudentChip
             key={o.studentId}
             occupant={o}
             onDragStart={(e) => { e.dataTransfer.setData('text/student-id', o.studentId); e.dataTransfer.effectAllowed = 'move'; }}
+            onClick={() => onJumpToStudent && onJumpToStudent(o.studentId)}
           />
         ))}
       </div>
@@ -1435,13 +1483,13 @@ function CoachingRoomCard({ slot }) {
   );
 }
 
-function WeekBlock({ label, grid }) {
+function WeekBlock({ label, grid, onJumpToStudent }) {
   return (
     <div className="mb-6">
-      <div className="mb-2 flex items-center gap-2 px-1">
+      <div className="mb-2 flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 shadow-sm">
         <h3 className="text-sm font-semibold text-gray-800">{label}</h3>
         <Badge tone={grid.weekLabel === 'A' ? 'blue' : 'gray'}>{grid.weekLabel}주</Badge>
-        <span className="text-xs text-gray-400">{formatMonthDay(grid.weekMonday)} ~ {formatMonthDay(dateOfWeekday(grid.weekMonday, '금'))}</span>
+        <span className="text-xs font-medium text-gray-500">{formatMonthDay(grid.weekMonday)} ~ {formatMonthDay(dateOfWeekday(grid.weekMonday, '금'))}</span>
       </div>
       <div className="grid grid-cols-[48px_repeat(5,1fr)] gap-1.5">
         <div />
@@ -1454,7 +1502,7 @@ function WeekBlock({ label, grid }) {
         {TIME_SLOTS.map((time) => (
           <Fragment key={time}>
             <div className="flex items-center justify-end pr-1 text-[10px] font-medium text-gray-400">{time}</div>
-            {WEEKDAYS.map((wd) => <CoachingRoomCard key={`${wd}-${time}`} slot={grid.slots[wd][time]} />)}
+            {WEEKDAYS.map((wd) => <CoachingRoomCard key={`${wd}-${time}`} slot={grid.slots[wd][time]} onJumpToStudent={onJumpToStudent} />)}
           </Fragment>
         ))}
       </div>
@@ -1462,7 +1510,7 @@ function WeekBlock({ label, grid }) {
   );
 }
 
-function SchedulePanel() {
+function SchedulePanel({ onJumpToStudent }) {
   const { students, selectedTeacherId, baseMonday } = useApp();
   const teacherStudents = useMemo(() => students.filter((s) => s.teacherId === selectedTeacherId), [students, selectedTeacherId]);
   const weekMondays = useMemo(() => [baseMonday, addWeeks(baseMonday, 1)], [baseMonday]);
@@ -1470,8 +1518,8 @@ function SchedulePanel() {
 
   return (
     <div className="h-full overflow-y-auto px-4 py-4">
-      <WeekBlock label="이번 주" grid={grids[0]} />
-      <WeekBlock label="다음 주" grid={grids[1]} />
+      <WeekBlock label="이번 주" grid={grids[0]} onJumpToStudent={onJumpToStudent} />
+      <WeekBlock label="다음 주" grid={grids[1]} onJumpToStudent={onJumpToStudent} />
     </div>
   );
 }
@@ -1930,7 +1978,7 @@ function AppShell() {
                 highlightedId={highlightedId}
               />
             }
-            right={<SchedulePanel />}
+            right={<SchedulePanel onJumpToStudent={handleJumpToStudent} />}
             defaultLeftPercent={58}
           />
         )}

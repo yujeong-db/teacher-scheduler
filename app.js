@@ -126,12 +126,39 @@ function occupantColor(student, onLeave) {
   if (student.product === '자주표A' || student.product === '자주표B') return 'blue';
   return 'black';
 }
-function toOccupant(student, classDateIso) {
+// When two different real students (different member numbers) share the exact same
+// name within a teacher's roster, tag them with (A)/(B)/... suffixes so they can be
+// told apart in the member list and calendar. Order is by member number then by
+// roster position, for a stable/deterministic result. Students sharing a name AND
+// member number are treated as one real duplicate entry (already flagged elsewhere)
+// and are not suffixed.
+function buildNameSuffixMap(students) {
+  const groups = new Map();
+  students.forEach((s, idx) => {
+    const name = (s.name || '').trim();
+    if (!name) return;
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push({ id: s.id, memberNo: s.memberNo || '', idx });
+  });
+  const map = new Map();
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    const distinctNos = new Set(list.map((x) => x.memberNo));
+    if (distinctNos.size < 2) continue;
+    const sorted = list.slice().sort((a, b) => a.memberNo.localeCompare(b.memberNo) || a.idx - b.idx);
+    sorted.forEach((item, i) => {
+      map.set(item.id, String.fromCharCode(65 + i));
+    });
+  }
+  return map;
+}
+
+function toOccupant(student, classDateIso, nameSuffix) {
   const onLeave = studentOnLeave(student, classDateIso);
   return {
     studentId: student.id,
     memberNo: student.memberNo,
-    name: student.name,
+    name: nameSuffix ? `${student.name} (${nameSuffix})` : student.name,
     level: student.level,
     product: student.product,
     color: occupantColor(student, onLeave),
@@ -152,6 +179,7 @@ function hypotheticalCount(students, weekday, time, weekMonday, label) {
   }).length;
 }
 function buildSchedule({ students, guests = [], weekMondays, biweeklyRooms = [] }) {
+  const nameSuffixMap = buildNameSuffixMap(students);
   return weekMondays.map((weekMonday) => {
     const label = weekLabel(weekMonday);
     const slots = {};
@@ -164,7 +192,7 @@ function buildSchedule({ students, guests = [], weekMondays, biweeklyRooms = [] 
         const occupantStudents = isBiweeklyOffWeek
           ? []
           : students.filter((s) => s.weekday === weekday && s.time === time && studentAppliesToWeek(s, weekMonday));
-        const occupants = occupantStudents.map((s) => toOccupant(s, classDateIso));
+        const occupants = occupantStudents.map((s) => toOccupant(s, classDateIso, nameSuffixMap.get(s.id)));
         const currentCount = occupants.filter((o) => !o.onLeave).length;
         const otherLabel = label === 'A' ? 'B' : 'A';
         const otherCount = hypotheticalCount(students, weekday, time, weekMonday, otherLabel);
@@ -255,6 +283,42 @@ function capacityBadgeForSlot(students, weekday, time, weekMondays) {
     const otherCount = hypotheticalCount(students, weekday, time, weekMonday, otherLabel);
     if (currentCount >= FIXED_CAPACITY) return 'FULL';
     if (otherCount >= FIXED_CAPACITY) worst = 'WARN';
+  }
+  return worst;
+}
+
+// Only the student(s) that actually push a slot past FIXED_CAPACITY should see the
+// "정원 초과" warning — not everyone already validly in that room. Rank is based on
+// each student's position in the full roster (i.e. insertion order), so earlier
+// members stay warning-free even after later additions overflow the room.
+function capacityWarningForStudent(allStudents, student, weekMondays) {
+  const relevantWeeks = relevantWeekMondaysForProduct(weekMondays, student.product);
+  let worst = null;
+  for (const weekMonday of relevantWeeks) {
+    if (!studentAppliesToWeek(student, weekMonday)) continue;
+    const classDateIso = dateOfWeekday(weekMonday, student.weekday);
+    if (studentOnLeave(student, classDateIso)) continue;
+
+    const activeOccupants = allStudents.filter((s) => {
+      if (s.weekday !== student.weekday || s.time !== student.time) return false;
+      if (!studentAppliesToWeek(s, weekMonday)) return false;
+      return !studentOnLeave(s, dateOfWeekday(weekMonday, s.weekday));
+    });
+    const rank = activeOccupants.findIndex((s) => s.id === student.id) + 1;
+    if (rank > FIXED_CAPACITY) return 'FULL';
+
+    // Only genuinely alternate-parity-exclusive members (자주표A/B on the other
+    // label) represent an *additional* other-week risk. Always-weekly (단과/전과목)
+    // members are already counted in `rank` above, so re-counting them here would
+    // falsely warn every valid member of an already-weekly-only full room.
+    const label = weekLabel(weekMonday);
+    const otherLabel = label === 'A' ? 'B' : 'A';
+    const otherOnlyCount = allStudents.filter((s) => {
+      if (s.weekday !== student.weekday || s.time !== student.time) return false;
+      if (weekMonday < s.startWeek) return false;
+      return s.product === '자주표' + otherLabel;
+    }).length;
+    if (otherOnlyCount >= FIXED_CAPACITY) worst = 'WARN';
   }
   return worst;
 }
@@ -1185,7 +1249,7 @@ function SuggestionRow({ student, weekMondays }) {
   );
 }
 
-function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
+function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted, nameSuffix }) {
   const [expanded, setExpanded] = useState(false);
   const { updateStudent, removeStudent, students } = useApp();
 
@@ -1200,14 +1264,8 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
   }
 
   const capacityBadge = useMemo(
-    () =>
-      capacityBadgeForSlot(
-        students.filter((s) => s.teacherId === student.teacherId && s.id !== student.id),
-        student.weekday,
-        student.time,
-        relevantWeekMondaysForProduct(weekMondays, student.product)
-      ),
-    [students, student.teacherId, student.id, student.weekday, student.time, weekMondays, student.product]
+    () => capacityWarningForStudent(students.filter((s) => s.teacherId === student.teacherId), student, weekMondays),
+    [students, student.teacherId, student.id, student.weekday, student.time, student.product, student.startWeek, student.holidayPeriods, weekMondays]
   );
 
   return (
@@ -1235,6 +1293,11 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           placeholder="회원명"
           className={cn('w-[80px] shrink-0 font-medium', student.important && 'text-red-600')}
         />
+        {nameSuffix && (
+          <span className="shrink-0 text-[10px] font-semibold text-gray-400" title="동명이인 구분용으로 자동으로 붙은 표시입니다">
+            ({nameSuffix})
+          </span>
+        )}
 
         {isDuplicate && (
           <span title="동일 회원번호가 중복 등록되어 있습니다">
@@ -1380,6 +1443,7 @@ function MemberList({ statFilter, onClearStatFilter, weekMondays, onJumpToStuden
 
   const teacherStudents = useMemo(() => students.filter((s) => s.teacherId === selectedTeacherId), [students, selectedTeacherId]);
   const duplicateNos = useMemo(() => findDuplicateMemberNos(teacherStudents), [teacherStudents]);
+  const nameSuffixMap = useMemo(() => buildNameSuffixMap(teacherStudents), [teacherStudents]);
 
   const filtered = useMemo(() => {
     return teacherStudents.filter((s) => {
@@ -1480,6 +1544,7 @@ function MemberList({ statFilter, onClearStatFilter, weekMondays, onJumpToStuden
             weekMondays={weekMondays}
             rowRef={(el) => { rowRefs.current[s.id] = el; }}
             highlighted={highlightedId === s.id}
+            nameSuffix={nameSuffixMap.get(s.id)}
           />
         ))}
       </div>
@@ -1541,6 +1606,11 @@ function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
 
   const activeCount = slot.occupants.filter((o) => !o.onLeave).length;
   const rosterLevels = slot.rosterLevels || [];
+  // A room with roster members but nobody attending this specific week (자주표 off
+  // week, not explicitly flagged biweekly) is "resting" — still show its level/count
+  // like every other room, just grayed out instead of colored.
+  const isRestingThisWeek = activeCount === 0 && slot.rosterCount > 0;
+  const displayCount = activeCount > 0 ? activeCount : slot.rosterCount;
 
   return (
     <div
@@ -1590,17 +1660,21 @@ function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
               className="mr-0.5"
             />
             {rosterLevels.slice(0, 2).map((lv, i) => (
-              <span key={lv} style={{ color: levelColor(lv) }}>
+              <span key={lv} style={{ color: isRestingThisWeek ? '#9ca3af' : levelColor(lv) }}>
                 {i > 0 && <span className="text-gray-300">/</span>}Lv.{lv}
               </span>
             ))}
             {rosterLevels.length > 2 && <span className="text-gray-400">…</span>}
           </span>
-          {activeCount > 0 ? (
-            <span className={cn('text-xs font-bold', activeCount >= FIXED_CAPACITY ? 'text-red-600' : 'text-sky-600')}>{activeCount}/{FIXED_CAPACITY}</span>
-          ) : (
-            <span className="text-[10px] font-medium text-gray-400" title="자주표 회원만 있어 이번 주는 실제 수업이 없는 방입니다">배정 {slot.rosterCount}명 · 이번 주 휴무</span>
-          )}
+          <span
+            className={cn(
+              'text-xs font-bold',
+              isRestingThisWeek ? 'text-gray-400' : displayCount >= FIXED_CAPACITY ? 'text-red-600' : 'text-sky-600'
+            )}
+            title={isRestingThisWeek ? '자주표 회원만 있어 이번 주는 실제 수업이 없는 방입니다' : undefined}
+          >
+            {displayCount}/{FIXED_CAPACITY}
+          </span>
         </div>
       )}
 

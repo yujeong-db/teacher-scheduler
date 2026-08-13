@@ -138,6 +138,7 @@ function toOccupant(student, classDateIso) {
     onLeave,
     availableNote: student.availableNote,
     memo: student.memo,
+    holidayPeriods: student.holidayPeriods,
   };
 }
 function hypotheticalCount(students, weekday, time, weekMonday, label) {
@@ -183,6 +184,16 @@ function buildSchedule({ students, guests = [], weekMondays, biweeklyRooms = [] 
         ).length;
         const fixedTableOverflow = fixedTableActiveCount >= 5;
 
+        // Roster = every student permanently assigned to this weekday/time, regardless
+        // of whether they're individually "active" this specific week (자주표A/B
+        // students only ever occupy every other week). Rooms are weekly by default, so
+        // the level/headcount label should stay visible even on a 자주표 member's off
+        // week — only an explicit biweekly flag should make the whole room disappear.
+        const rosterStudents = isBiweeklyOffWeek
+          ? []
+          : students.filter((s) => s.weekday === weekday && s.time === time && weekMonday >= s.startWeek);
+        const rosterLevels = Array.from(new Set(rosterStudents.map((s) => s.level)));
+
         const guestCount = guests.filter(
           (g) => g.weekday === weekday && g.time === time && g.weekMonday === weekMonday
         ).length;
@@ -191,6 +202,8 @@ function buildSchedule({ students, guests = [], weekMondays, biweeklyRooms = [] 
           weekday, time, weekMonday, occupants, guestCount, capacityBadge, levelMixWarning, fixedTableOverflow,
           biweekly: !!biweeklyEntry,
           biweeklyParity: biweeklyEntry ? biweeklyEntry.parity : null,
+          rosterCount: rosterStudents.length,
+          rosterLevels,
         };
       }
     }
@@ -320,6 +333,22 @@ function parseAvailability(note) {
     let h = parseInt(beforeMatch[1], 10);
     if (h < 9) h += 12;
     maxHour = maxHour === null ? h : Math.min(maxHour, h);
+  }
+  // Bare exact-time mentions like "4시" or "4:30" (no 이후/이전/까지 qualifier) pinpoint
+  // a tight one-hour window around that time, e.g. "화 4시" / "화 4:30" -> ~16:00.
+  const bareHourMatches = text.matchAll(/(\d{1,2})\s*시(?!\s*(?:이후|이전|까지))/g);
+  for (const m of bareHourMatches) {
+    let h = parseInt(m[1], 10);
+    if (h < 9) h += 12;
+    minHour = minHour === null ? h : Math.min(minHour, h);
+    maxHour = maxHour === null ? h + 1 : Math.max(maxHour, h + 1);
+  }
+  const bareColonMatches = text.matchAll(/(\d{1,2}):(\d{2})/g);
+  for (const m of bareColonMatches) {
+    let h = parseInt(m[1], 10);
+    if (h < 9) h += 12;
+    minHour = minHour === null ? h : Math.min(minHour, h);
+    maxHour = maxHour === null ? h + 1 : Math.max(maxHour, h + 1);
   }
   if (weekdays.size === 0 && minHour === null && maxHour === null) return null;
   return {
@@ -603,6 +632,15 @@ function useSharedData() {
   const writeTimerRef = useRef(null);
   const latestDataRef = useRef(data);
   latestDataRef.current = data;
+  // While the user is actively typing, our own debounced write to Supabase echoes
+  // back through the realtime subscription a few hundred ms later. Without this
+  // guard, that echo (which reflects an older, already-superseded snapshot) would
+  // blindly overwrite local state and silently erase whatever was typed in the
+  // meantime (e.g. clearing a field then retyping would keep getting reset to
+  // empty). We suppress incoming realtime updates for a short window after every
+  // local edit so our own in-flight write always wins locally; it converges once
+  // typing pauses and the write actually lands.
+  const suppressRemoteUntilRef = useRef(0);
 
   useEffect(() => {
     if (!isSupabaseConfigured()) return;
@@ -642,6 +680,7 @@ function useSharedData() {
             { event: 'UPDATE', schema: 'public', table: SHARED_TABLE, filter: `id=eq.${SHARED_ROW_ID}` },
             (payload) => {
               if (payload.new && payload.new.data) {
+                if (Date.now() < suppressRemoteUntilRef.current) return; // stale echo of our own recent edit
                 setData(migrateSharedData(payload.new.data));
               }
             }
@@ -693,6 +732,7 @@ function useSharedData() {
   }, [data, connected]);
 
   const updateData = useCallback((updater) => {
+    suppressRemoteUntilRef.current = Date.now() + 1600; // debounce (500ms) + network/realtime propagation buffer
     setData((prev) => (prev ? updater(prev) : prev));
   }, []);
 
@@ -1153,6 +1193,12 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
     updateStudent(student.id, p);
   }
 
+  function handleDeleteClick() {
+    if (window.confirm(`정말 ${student.name || '이 회원'}을(를) 삭제하시겠습니까?`)) {
+      removeStudent(student.id);
+    }
+  }
+
   const capacityBadge = useMemo(
     () =>
       capacityBadgeForSlot(
@@ -1246,6 +1292,14 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
             {MEMBER_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </Select>
         </div>
+
+        <button
+          onClick={handleDeleteClick}
+          title="회원 삭제"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-gray-400 hover:bg-red-50 hover:text-red-600"
+        >
+          <XIcon className="h-4 w-4" />
+        </button>
       </div>
 
       <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-8 text-[11px] text-gray-500">
@@ -1308,12 +1362,6 @@ function MemberRow({ student, isDuplicate, weekMondays, rowRef, highlighted }) {
           <div>
             <label className="mb-1 block text-[11px] font-medium text-gray-400">결석(타 클래스 참여) 기간</label>
             <HolidayEditor student={student} />
-          </div>
-
-          <div className="flex justify-end">
-            <Button size="sm" variant="ghost" className="text-red-500 hover:bg-red-50" onClick={() => removeStudent(student.id)}>
-              <TrashIcon className="h-3.5 w-3.5" /> 회원 삭제
-            </Button>
           </div>
         </div>
       )}
@@ -1465,7 +1513,19 @@ function StudentChip({ occupant, onDragStart, onClick }) {
       content={
         <div className="space-y-1">
           <div className="font-semibold text-gray-800">{occupant.name} · Lv.{occupant.level}</div>
-          {occupant.onLeave && <div className="text-gray-500">(알) 현재 다른 클래스 참여 중</div>}
+          {occupant.onLeave && (
+            <div className="text-gray-500">
+              {occupant.holidayPeriods && occupant.holidayPeriods.length > 0 ? (
+                occupant.holidayPeriods.map((hp) => (
+                  <div key={hp.id}>
+                    (알) {formatMonthDay(hp.startDate)}~{formatMonthDay(hp.endDate)} 결석{hp.reason ? ` · ${hp.reason}` : ''}
+                  </div>
+                ))
+              ) : (
+                <div>(알)</div>
+              )}
+            </div>
+          )}
           <div className="text-gray-500">상품: {occupant.product}</div>
           {occupant.availableNote && <div className="text-gray-500">가능 시간: {occupant.availableNote}</div>}
           {occupant.memo && <div className="text-gray-500">메모: {occupant.memo}</div>}
@@ -1480,7 +1540,7 @@ function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
   const [dragOver, setDragOver] = useState(false);
 
   const activeCount = slot.occupants.filter((o) => !o.onLeave).length;
-  const levels = Array.from(new Set(slot.occupants.map((o) => o.level)));
+  const rosterLevels = slot.rosterLevels || [];
 
   return (
     <div
@@ -1521,7 +1581,7 @@ function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
         </div>
       )}
 
-      {(slot.occupants.length > 0 || slot.biweekly) && (
+      {slot.rosterCount > 0 && (
         <div className="mb-1 flex items-center justify-between px-0.5">
           <span className="flex items-center gap-1 text-sm font-extrabold leading-none">
             <Checkbox
@@ -1529,21 +1589,17 @@ function CoachingRoomCard({ slot, onJumpToStudent, onToggleBiweekly }) {
               onChange={() => onToggleBiweekly && onToggleBiweekly(slot.weekday, slot.time)}
               className="mr-0.5"
             />
-            {slot.occupants.length > 0 ? (
-              <>
-                {levels.slice(0, 2).map((lv, i) => (
-                  <span key={lv} style={{ color: levelColor(lv) }}>
-                    {i > 0 && <span className="text-gray-300">/</span>}Lv.{lv}
-                  </span>
-                ))}
-                {levels.length > 2 && <span className="text-gray-400">…</span>}
-              </>
-            ) : (
-              <span className="text-[10px] font-medium text-gray-400" title="격주로 열리는 방입니다. 이번 주는 쉬는 주입니다.">격주 휴무주</span>
-            )}
+            {rosterLevels.slice(0, 2).map((lv, i) => (
+              <span key={lv} style={{ color: levelColor(lv) }}>
+                {i > 0 && <span className="text-gray-300">/</span>}Lv.{lv}
+              </span>
+            ))}
+            {rosterLevels.length > 2 && <span className="text-gray-400">…</span>}
           </span>
-          {slot.occupants.length > 0 && (
+          {activeCount > 0 ? (
             <span className={cn('text-xs font-bold', activeCount >= FIXED_CAPACITY ? 'text-red-600' : 'text-sky-600')}>{activeCount}/{FIXED_CAPACITY}</span>
+          ) : (
+            <span className="text-[10px] font-medium text-gray-400" title="자주표 회원만 있어 이번 주는 실제 수업이 없는 방입니다">배정 {slot.rosterCount}명 · 이번 주 휴무</span>
           )}
         </div>
       )}
